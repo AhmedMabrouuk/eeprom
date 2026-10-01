@@ -60,8 +60,8 @@ all: main-build
 main-build: eeprom.elf secondary-outputs
 
 # Tool invocations
-eeprom.elf eeprom.map: $(OBJS) $(USER_OBJS) D:\EL\ ARABY\tasks\eeprom\mxCube\mxCube\eeprom\STM32G491VCTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "eeprom.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"D:\EL ARABY\tasks\eeprom\mxCube\mxCube\eeprom\STM32G491VCTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="eeprom.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+eeprom.elf eeprom.map: $(OBJS) $(USER_OBJS) D:\EL\ ARABY\tasks\eeprom\eeprom\eeprom\STM32G491VCTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "eeprom.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"D:\EL ARABY\tasks\eeprom\eeprom\eeprom\STM32G491VCTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="eeprom.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

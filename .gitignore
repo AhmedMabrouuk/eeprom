@@ -1,0 +1,5 @@
+eeprom/Debug/Core/Src/main.o
+eeprom/Debug/makefile
+eeprom/Debug/eeprom.map
+eeprom/Debug/eeprom.list
+eeprom/Debug/eeprom.elf
