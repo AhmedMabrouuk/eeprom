@@ -1,3 +1,6 @@
+# Build output directories
+Debug/
+
 eeprom/Debug/Core/Src/main.o
 eeprom/Debug/makefile
 eeprom/Debug/eeprom.map
