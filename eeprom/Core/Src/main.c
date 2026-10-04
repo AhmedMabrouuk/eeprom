@@ -21,30 +21,39 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "eeprom.h"
+#include "exteprom.h"
 #include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-/* Commands you write into dbg_cmd from Live Expressions */
+/* Commands: write a number into dbg_cmd (Live Expressions). The loop runs it
+ * and sets dbg_cmd back to 0 when finished. */
 typedef enum
 {
-  DBG_CMD_NONE       = 0,
-  DBG_CMD_READ_BYTE  = 1,   /* read byte at dbg_addr           -> dbg_byte  */
-  DBG_CMD_READ_PAGE  = 2,   /* read page number dbg_page_no    -> dbg_page  */
-  DBG_CMD_READ_ALL   = 3,   /* read all 256 bytes              -> dbg_all   */
-  DBG_CMD_WRITE_TEST = 4,   /* (re)write the 30..50 test array              */
-  DBG_CMD_ERASE_ALL  = 5    /* fill the whole chip with 0xFF                */
+  DBG_CMD_NONE        = 0,
+  DBG_CMD_READ_BYTE   = 1,   /* EXTEPROM_Data_Direct_Read  1 byte  @ dbg_addr      */
+  DBG_CMD_READ_PAGE   = 2,   /* EXTEPROM_Data_Direct_Read  8 bytes @ dbg_page_no*8 */
+  DBG_CMD_READ_ALL    = 3,   /* EXTEPROM_Data_Direct_Read  256 bytes               */
+  DBG_CMD_WRITE_TEST  = 4,   /* EXTEPROM_Data_Direct_Write the 30..50 pattern      */
+  DBG_CMD_WRITE_BYTE  = 5,   /* EXTEPROM_Data_Direct_Write dbg_wr_value @ dbg_wr_addr */
+  DBG_CMD_WRITE_BLOCK = 6,   /* EXTEPROM_Data_Direct_Write dbg_wr_buf[dbg_wr_len] @ dbg_wr_addr */
+  DBG_CMD_ERASE_BYTE  = 7,   /* EXTEPROM_Data_Byte_Erase   @ dbg_er_addr           */
+  DBG_CMD_ERASE_BLOCK = 8,   /* EXTEPROM_flashData_erase   block dbg_er_block      */
+  DBG_CMD_ERASE_ALL   = 9,   /* EXTEPROM_flashData_eraseAll                        */
+  DBG_CMD_REINIT      = 10,  /* EXTEPROM_init(dbg_clk_mhz) + refresh capabilities  */
+  DBG_CMD_SELFTEST    = 11   /* automatic test of ALL APIs (erases the chip!)      */
 } dbg_cmd_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define TEST_START_ADDR   30u
-#define TEST_END_ADDR     50u                                   /* inclusive */
-#define TEST_LEN          (TEST_END_ADDR - TEST_START_ADDR + 1u) /* = 21     */
+#define EEPROM_CLK_MHZ      16u                                  /* I2C kernel clock */
+#define TEST_START_ADDR     30u
+#define TEST_END_ADDR       50u                                  /* inclusive        */
+#define TEST_LEN            (TEST_END_ADDR - TEST_START_ADDR + 1u) /* = 21           */
+#define DBG_WR_BUF_SIZE     32u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,28 +65,60 @@ typedef enum
 I2C_HandleTypeDef hi2c1;
 
 /* USER CODE BEGIN PV */
-/* All of these are GLOBAL on purpose -> add them to Live Expressions */
+/* ======================= ALL GLOBAL -> Live Expressions ==================== */
 
-eeprom_t ee;                          /* driver object                        */
+/* ---- per-API result: status returned by EXTEPROM_Status_Get() right after
+ *      that API was called (0 = EXTEPROM_OK) ---- */
+volatile EXTEPROM_Status_t st_init        = EXTEPROM_ERR_NOT_INIT; /* EXTEPROM_init            */
+volatile EXTEPROM_Status_t st_write       = EXTEPROM_OK;           /* EXTEPROM_Data_Direct_Write */
+volatile EXTEPROM_Status_t st_read        = EXTEPROM_OK;           /* EXTEPROM_Data_Direct_Read  */
+volatile EXTEPROM_Status_t st_erase_block = EXTEPROM_OK;           /* EXTEPROM_flashData_erase   */
+volatile EXTEPROM_Status_t st_erase_byte  = EXTEPROM_OK;           /* EXTEPROM_Data_Byte_Erase   */
+volatile EXTEPROM_Status_t st_erase_all   = EXTEPROM_OK;           /* EXTEPROM_flashData_eraseAll*/
 
-/* ---- test pattern ---- */
-uint8_t  ee_tx[TEST_LEN];             /* what we write: ee_tx[i] = 30 + i     */
-uint8_t  ee_rx[TEST_LEN];             /* what we read back from addr 30..50   */
+/* ---- per-API verdict: 1 = the API did what it should, verified by reading
+ *      the chip back (not just "no error") ---- */
+uint8_t ok_write        = 0;
+uint8_t ok_read         = 0;
+uint8_t ok_erase_block  = 0;
+uint8_t ok_erase_byte   = 0;
+uint8_t ok_erase_all    = 0;
 
-/* ---- command interface (you WRITE these in Live Expressions) ---- */
-volatile uint8_t  dbg_cmd     = DBG_CMD_NONE;  /* set 1..5, returns to 0 when done */
-volatile uint16_t dbg_addr    = 33;            /* byte address for READ_BYTE       */
-volatile uint8_t  dbg_page_no = 0;             /* 0..31 for READ_PAGE              */
+/* ---- test pattern (written to EEPROM addresses 30..50) ---- */
+uint8_t ee_tx[TEST_LEN];                 /* ee_tx[i] = 30 + i                    */
+uint8_t ee_rx[TEST_LEN];                 /* read back from addresses 30..50      */
+uint8_t dbg_verify_ok       = 0;         /* 1 = every address 30..50 holds its own number */
+uint16_t dbg_mismatch_count = 0;
 
-/* ---- results (you READ these) ---- */
-uint8_t  dbg_byte             = 0;             /* result of READ_BYTE              */
-uint8_t  dbg_page[EEPROM_PAGE_SIZE];           /* result of READ_PAGE (8 bytes)    */
-uint8_t  dbg_all[EEPROM_SIZE];                 /* result of READ_ALL (256 bytes)   */
+/* ---- command interface (you WRITE these) ---- */
+volatile uint8_t  dbg_cmd      = DBG_CMD_NONE;
+volatile uint16_t dbg_addr     = 33;     /* READ_BYTE address                    */
+volatile uint8_t  dbg_page_no  = 0;      /* READ_PAGE: 0..31                     */
+volatile uint16_t dbg_wr_addr  = 0;      /* WRITE_BYTE / WRITE_BLOCK address     */
+volatile uint8_t  dbg_wr_value = 0;      /* WRITE_BYTE value                     */
+volatile uint8_t  dbg_wr_len   = 0;      /* WRITE_BLOCK length (1..32)           */
+uint8_t           dbg_wr_buf[DBG_WR_BUF_SIZE]; /* WRITE_BLOCK data               */
+volatile uint16_t dbg_er_addr  = 0;      /* ERASE_BYTE address                   */
+volatile uint16_t dbg_er_block = 0;      /* ERASE_BLOCK number: 0..31            */
+volatile uint8_t  dbg_clk_mhz  = EEPROM_CLK_MHZ; /* REINIT clock (try 100 -> ERR_CLOCK) */
 
-volatile eeprom_status_t dbg_status = EEPROM_OK; /* status of the LAST driver call */
-uint8_t  dbg_verify_ok        = 0;   /* 1 = every addr 30..50 holds its own value */
-uint16_t dbg_mismatch_count   = 0;   /* how many of addr 30..50 are wrong         */
-uint32_t dbg_cmd_done_count   = 0;   /* increments after each command finishes    */
+/* ---- results of the read / write / erase commands ---- */
+uint8_t  dbg_byte = 0;                           /* READ_BYTE result             */
+uint8_t  dbg_page[EXTEPROM_PAGE_SIZE_BYTES];     /* READ_PAGE / ERASE_BLOCK read-back */
+uint8_t  dbg_all[EXTEPROM_SIZE_BYTES];           /* READ_ALL / ERASE_ALL read-back    */
+uint8_t  dbg_wr_rb[DBG_WR_BUF_SIZE];             /* read-back after WRITE_*           */
+uint8_t  dbg_er_rb = 0;                          /* read-back after ERASE_BYTE (expect 255) */
+
+/* ---- bookkeeping ---- */
+volatile EXTEPROM_Status_t dbg_status = EXTEPROM_OK; /* status of the LAST API call   */
+uint32_t dbg_last_op_us     = 0;     /* measured duration of the last API call (us)   */
+uint32_t dbg_cmd_done_count = 0;     /* +1 after every finished command               */
+EXTEPROM_Capabilities_t ee_caps;     /* sizes, limits, timing (from EXTEPROM_Capabilities_Get) */
+
+/* ---- self-test result (command 11) ---- */
+uint8_t selftest_pass      = 0;      /* 1 = every API passed                          */
+uint8_t selftest_fail_step = 0;      /* 0 = none; 1 init, 2 eraseAll, 3 write, 4 read,
+                                        5 byte erase, 6 block erase, 7 range checks   */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -85,104 +126,345 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
-static void EEPROM_Boot(void);
-static void DBG_Service(void);
-static void DBG_CheckRegion(const uint8_t *img);
+static void    Tmr_Start(void);
+static void    Tmr_Stop(void);
+static uint8_t All_Equal(const uint8_t *p, uint16_t n, uint8_t v);
+static void    Check_Region(const uint8_t *img);
+static void    EEPROM_Boot(void);
+static uint8_t SelfTest(void);
+static void    DBG_Service(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Compare a full 256-byte image against the rule "address N holds value N"
- * for N = 30..50 only. (The rest of the chip is not part of the test.) */
-static void DBG_CheckRegion(const uint8_t *img)
+/* ---- microsecond stopwatch (DWT cycle counter; falls back to 1 ms tick) ---- */
+static uint32_t t_start;
+
+#if defined(DWT)
+static void Tmr_Start(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
+  t_start = DWT->CYCCNT;
+}
+static void Tmr_Stop(void)
+{
+  dbg_last_op_us = (DWT->CYCCNT - t_start) / (SystemCoreClock / 1000000u);
+}
+#else
+static void Tmr_Start(void) { t_start = HAL_GetTick(); }
+static void Tmr_Stop(void)  { dbg_last_op_us = (HAL_GetTick() - t_start) * 1000u; }
+#endif
+
+static uint8_t All_Equal(const uint8_t *p, uint16_t n, uint8_t v)
+{
+  for (uint16_t i = 0; i < n; i++)
+  {
+    if (p[i] != v) { return 0u; }
+  }
+  return 1u;
+}
+
+/* Rule under test: in a 256-byte image, address N holds value N for N = 30..50. */
+static void Check_Region(const uint8_t *img)
 {
   uint16_t bad = 0;
 
   for (uint16_t a = TEST_START_ADDR; a <= TEST_END_ADDR; a++)
   {
-    if (img[a] != (uint8_t)a)
-    {
-      bad++;
-    }
+    if (img[a] != (uint8_t)a) { bad++; }
   }
   dbg_mismatch_count = bad;
   dbg_verify_ok      = (bad == 0u) ? 1u : 0u;
 }
 
-/* Runs once at boot: build the pattern, store it, read it back, verify. */
+/* Runs once at boot: init, store the 30..50 pattern, read it back, verify. */
 static void EEPROM_Boot(void)
 {
-  /* 1. Build pattern: ee_tx[0]=30, ee_tx[1]=31 ... ee_tx[20]=50 */
   for (uint16_t i = 0; i < TEST_LEN; i++)
   {
     ee_tx[i] = (uint8_t)(TEST_START_ADDR + i);
   }
 
-  /* 2. Init driver (probes the chip) */
-  dbg_status = eeprom_init(&ee, &hi2c1);
-  if (dbg_status != EEPROM_OK) { return; }
+  EXTEPROM_init(EEPROM_CLK_MHZ);
+  st_init    = EXTEPROM_Status_Get();
+  dbg_status = st_init;
+  EXTEPROM_Capabilities_Get(&ee_caps);
+  if (st_init != EXTEPROM_OK) { return; }
 
-  /* 3. Store at EEPROM addresses 30..50.
-   *    update() instead of write(): if the chip already holds the pattern
-   *    (e.g. after a reset) nothing is rewritten, so no wear. */
-  dbg_status = eeprom_update(&ee, TEST_START_ADDR, ee_tx, TEST_LEN);
-  if (dbg_status != EEPROM_OK) { return; }
+  Tmr_Start();
+  EXTEPROM_Data_Direct_Write(TEST_START_ADDR, ee_tx, TEST_LEN);
+  Tmr_Stop();
+  st_write = EXTEPROM_Status_Get();
+  if (st_write != EXTEPROM_OK) { dbg_status = st_write; return; }
 
-  /* 4. Read the same region back */
-  dbg_status = eeprom_read(&ee, TEST_START_ADDR, ee_rx, TEST_LEN);
-  if (dbg_status != EEPROM_OK) { return; }
+  EXTEPROM_Data_Direct_Read(TEST_START_ADDR, ee_rx, TEST_LEN);
+  st_read    = EXTEPROM_Status_Get();
+  dbg_status = st_read;
+  if (st_read != EXTEPROM_OK) { return; }
+  ok_write = (memcmp(ee_tx, ee_rx, TEST_LEN) == 0) ? 1u : 0u;
 
-  /* 5. Read the whole chip so you can inspect it right away, then verify */
-  dbg_status = eeprom_read(&ee, 0, dbg_all, EEPROM_SIZE);
-  if (dbg_status != EEPROM_OK) { return; }
-
-  DBG_CheckRegion(dbg_all);
+  EXTEPROM_Data_Direct_Read(0, dbg_all, EXTEPROM_SIZE_BYTES);
+  st_read    = EXTEPROM_Status_Get();
+  dbg_status = st_read;
+  if (st_read == EXTEPROM_OK)
+  {
+    Check_Region(dbg_all);
+    ok_read = dbg_verify_ok;
+  }
 }
 
-/* Polled from the main loop. Write a command into dbg_cmd (Live Expressions),
- * this executes it and clears dbg_cmd back to 0 when finished. */
+/* Automatic test of every API. Returns 0 if all passed, else the failing step.
+ * WARNING: step 2 erases the whole chip. */
+static uint8_t SelfTest(void)
+{
+  uint8_t b = 0;
+  uint8_t pg[EXTEPROM_PAGE_SIZE_BYTES];
+
+  ok_write = ok_read = ok_erase_block = ok_erase_byte = ok_erase_all = 0;
+
+  /* 1. init */
+  if (st_init != EXTEPROM_OK) { return 1; }
+
+  /* 2. eraseAll: whole chip must read back 0xFF */
+  EXTEPROM_flashData_eraseAll();
+  st_erase_all = EXTEPROM_Status_Get();
+  if (st_erase_all != EXTEPROM_OK) { return 2; }
+  EXTEPROM_Data_Direct_Read(0, dbg_all, EXTEPROM_SIZE_BYTES);
+  if (EXTEPROM_Status_Get() != EXTEPROM_OK) { return 2; }
+  if (!All_Equal(dbg_all, EXTEPROM_SIZE_BYTES, 0xFFu)) { return 2; }
+  ok_erase_all = 1;
+
+  /* 3. write: pattern 30..50 crosses 3 page edges (32, 40, 48) */
+  EXTEPROM_Data_Direct_Write(TEST_START_ADDR, ee_tx, TEST_LEN);
+  st_write = EXTEPROM_Status_Get();
+  if (st_write != EXTEPROM_OK) { return 3; }
+  EXTEPROM_Data_Direct_Read(TEST_START_ADDR, ee_rx, TEST_LEN);
+  if (EXTEPROM_Status_Get() != EXTEPROM_OK) { return 3; }
+  if (memcmp(ee_tx, ee_rx, TEST_LEN) != 0) { return 3; }
+  ok_write = 1;
+
+  /* 4. read: single byte, one page, and the whole chip.
+   *    Everything outside 30..50 must still be 0xFF (proves no page wrap-around damage). */
+  EXTEPROM_Data_Direct_Read(33, &b, 1);
+  st_read = EXTEPROM_Status_Get();
+  if ((st_read != EXTEPROM_OK) || (b != 33u)) { return 4; }
+
+  EXTEPROM_Data_Direct_Read(32, pg, EXTEPROM_PAGE_SIZE_BYTES);
+  if (EXTEPROM_Status_Get() != EXTEPROM_OK) { return 4; }
+  for (uint8_t i = 0; i < EXTEPROM_PAGE_SIZE_BYTES; i++)
+  {
+    if (pg[i] != (uint8_t)(32u + i)) { return 4; }
+  }
+
+  EXTEPROM_Data_Direct_Read(0, dbg_all, EXTEPROM_SIZE_BYTES);
+  if (EXTEPROM_Status_Get() != EXTEPROM_OK) { return 4; }
+  Check_Region(dbg_all);
+  if (!dbg_verify_ok) { return 4; }
+  for (uint16_t a = 0; a < EXTEPROM_SIZE_BYTES; a++)
+  {
+    if (((a < TEST_START_ADDR) || (a > TEST_END_ADDR)) && (dbg_all[a] != 0xFFu)) { return 4; }
+  }
+  ok_read = 1;
+
+  /* 5. byte erase: address 40 becomes 0xFF, neighbours 39 and 41 untouched */
+  EXTEPROM_Data_Byte_Erase(40);
+  st_erase_byte = EXTEPROM_Status_Get();
+  if (st_erase_byte != EXTEPROM_OK) { return 5; }
+  EXTEPROM_Data_Direct_Read(39, pg, 3);                 /* addresses 39, 40, 41 */
+  if (EXTEPROM_Status_Get() != EXTEPROM_OK) { return 5; }
+  if ((pg[0] != 39u) || (pg[1] != 0xFFu) || (pg[2] != 41u)) { return 5; }
+  ok_erase_byte = 1;
+
+  /* 6. block erase: block 4 = addresses 32..39 become 0xFF, 31 and 41 untouched */
+  EXTEPROM_flashData_erase(4);
+  st_erase_block = EXTEPROM_Status_Get();
+  if (st_erase_block != EXTEPROM_OK) { return 6; }
+  EXTEPROM_Data_Direct_Read(32, pg, EXTEPROM_PAGE_SIZE_BYTES);
+  if (EXTEPROM_Status_Get() != EXTEPROM_OK) { return 6; }
+  if (!All_Equal(pg, EXTEPROM_PAGE_SIZE_BYTES, 0xFFu)) { return 6; }
+  EXTEPROM_Data_Direct_Read(31, &b, 1);
+  if ((EXTEPROM_Status_Get() != EXTEPROM_OK) || (b != 31u)) { return 6; }
+  EXTEPROM_Data_Direct_Read(41, &b, 1);
+  if ((EXTEPROM_Status_Get() != EXTEPROM_OK) || (b != 41u)) { return 6; }
+  ok_erase_block = 1;
+
+  /* 7. error handling: out-of-range requests must be refused and touch nothing */
+  EXTEPROM_Data_Direct_Read(250, dbg_all, 10);
+  if (EXTEPROM_Status_Get() != EXTEPROM_ERR_RANGE) { return 7; }
+  EXTEPROM_Data_Direct_Write(256, ee_tx, 1);
+  if (EXTEPROM_Status_Get() != EXTEPROM_ERR_RANGE) { return 7; }
+  EXTEPROM_Data_Byte_Erase(256);
+  if (EXTEPROM_Status_Get() != EXTEPROM_ERR_RANGE) { return 7; }
+  EXTEPROM_flashData_erase(EXTEPROM_BLOCK_COUNT);
+  if (EXTEPROM_Status_Get() != EXTEPROM_ERR_RANGE) { return 7; }
+  EXTEPROM_Data_Direct_Read(0, NULL, 1);
+  if (EXTEPROM_Status_Get() != EXTEPROM_ERR_PARAM) { return 7; }
+
+  /* leave the chip with the pattern restored */
+  EXTEPROM_Data_Direct_Write(TEST_START_ADDR, ee_tx, TEST_LEN);
+  st_write = EXTEPROM_Status_Get();
+  return 0;
+}
+
+/* Polled from the main loop. */
 static void DBG_Service(void)
 {
   uint8_t cmd = dbg_cmd;
 
-  if (cmd == DBG_CMD_NONE)
-  {
-    return;
-  }
+  if (cmd == DBG_CMD_NONE) { return; }
 
   switch (cmd)
   {
     case DBG_CMD_READ_BYTE:
-      dbg_status = eeprom_read(&ee, dbg_addr, &dbg_byte, 1);
+      Tmr_Start();
+      EXTEPROM_Data_Direct_Read(dbg_addr, &dbg_byte, 1);
+      Tmr_Stop();
+      st_read = EXTEPROM_Status_Get();  dbg_status = st_read;
       break;
 
     case DBG_CMD_READ_PAGE:
-      /* page n starts at n*8. page 32 -> addr 256 -> driver returns ERR_RANGE */
-      dbg_status = eeprom_read(&ee, (uint16_t)(dbg_page_no * EEPROM_PAGE_SIZE),
-                               dbg_page, EEPROM_PAGE_SIZE);
+      Tmr_Start();
+      EXTEPROM_Data_Direct_Read((uint16_t)(dbg_page_no * EXTEPROM_PAGE_SIZE_BYTES),
+                                dbg_page, EXTEPROM_PAGE_SIZE_BYTES);
+      Tmr_Stop();
+      st_read = EXTEPROM_Status_Get();  dbg_status = st_read;
       break;
 
     case DBG_CMD_READ_ALL:
-      dbg_status = eeprom_read(&ee, 0, dbg_all, EEPROM_SIZE);
-      if (dbg_status == EEPROM_OK) { DBG_CheckRegion(dbg_all); }
+      Tmr_Start();
+      EXTEPROM_Data_Direct_Read(0, dbg_all, EXTEPROM_SIZE_BYTES);
+      Tmr_Stop();
+      st_read = EXTEPROM_Status_Get();  dbg_status = st_read;
+      if (st_read == EXTEPROM_OK) { Check_Region(dbg_all); }
       break;
 
     case DBG_CMD_WRITE_TEST:
-      dbg_status = eeprom_write(&ee, TEST_START_ADDR, ee_tx, TEST_LEN);
+      Tmr_Start();
+      EXTEPROM_Data_Direct_Write(TEST_START_ADDR, ee_tx, TEST_LEN);
+      Tmr_Stop();
+      st_write = EXTEPROM_Status_Get();  dbg_status = st_write;
+      ok_write = 0;
+      if (st_write == EXTEPROM_OK)
+      {
+        EXTEPROM_Data_Direct_Read(TEST_START_ADDR, ee_rx, TEST_LEN);
+        ok_write = ((EXTEPROM_Status_Get() == EXTEPROM_OK) &&
+                    (memcmp(ee_tx, ee_rx, TEST_LEN) == 0)) ? 1u : 0u;
+      }
       break;
 
+    case DBG_CMD_WRITE_BYTE:
+    {
+      uint16_t a = dbg_wr_addr;
+      uint8_t  v = dbg_wr_value;
+
+      Tmr_Start();
+      EXTEPROM_Data_Direct_Write(a, &v, 1);
+      Tmr_Stop();
+      st_write = EXTEPROM_Status_Get();  dbg_status = st_write;
+      ok_write = 0;
+      if (st_write == EXTEPROM_OK)
+      {
+        EXTEPROM_Data_Direct_Read(a, dbg_wr_rb, 1);
+        ok_write = ((EXTEPROM_Status_Get() == EXTEPROM_OK) && (dbg_wr_rb[0] == v)) ? 1u : 0u;
+      }
+      break;
+    }
+
+    case DBG_CMD_WRITE_BLOCK:
+    {
+      uint16_t a = dbg_wr_addr;
+      uint8_t  n = dbg_wr_len;
+
+      ok_write = 0;
+      if ((n == 0u) || (n > DBG_WR_BUF_SIZE)) { dbg_status = EXTEPROM_ERR_PARAM; break; }
+
+      Tmr_Start();
+      EXTEPROM_Data_Direct_Write(a, dbg_wr_buf, n);
+      Tmr_Stop();
+      st_write = EXTEPROM_Status_Get();  dbg_status = st_write;
+      if (st_write == EXTEPROM_OK)
+      {
+        memset(dbg_wr_rb, 0, sizeof(dbg_wr_rb));
+        EXTEPROM_Data_Direct_Read(a, dbg_wr_rb, n);
+        ok_write = ((EXTEPROM_Status_Get() == EXTEPROM_OK) &&
+                    (memcmp(dbg_wr_buf, dbg_wr_rb, n) == 0)) ? 1u : 0u;
+      }
+      break;
+    }
+
+    case DBG_CMD_ERASE_BYTE:
+    {
+      uint16_t a = dbg_er_addr;
+
+      Tmr_Start();
+      EXTEPROM_Data_Byte_Erase(a);
+      Tmr_Stop();
+      st_erase_byte = EXTEPROM_Status_Get();  dbg_status = st_erase_byte;
+      ok_erase_byte = 0;
+      if (st_erase_byte == EXTEPROM_OK)
+      {
+        EXTEPROM_Data_Direct_Read(a, &dbg_er_rb, 1);
+        ok_erase_byte = ((EXTEPROM_Status_Get() == EXTEPROM_OK) && (dbg_er_rb == 0xFFu)) ? 1u : 0u;
+      }
+      break;
+    }
+
+    case DBG_CMD_ERASE_BLOCK:
+    {
+      uint16_t blk = dbg_er_block;
+
+      Tmr_Start();
+      EXTEPROM_flashData_erase(blk);
+      Tmr_Stop();
+      st_erase_block = EXTEPROM_Status_Get();  dbg_status = st_erase_block;
+      ok_erase_block = 0;
+      if (st_erase_block == EXTEPROM_OK)
+      {
+        EXTEPROM_Data_Direct_Read((uint16_t)(blk * EXTEPROM_BLOCK_SIZE_BYTES),
+                                  dbg_page, EXTEPROM_BLOCK_SIZE_BYTES);
+        ok_erase_block = ((EXTEPROM_Status_Get() == EXTEPROM_OK) &&
+                          All_Equal(dbg_page, EXTEPROM_BLOCK_SIZE_BYTES, 0xFFu)) ? 1u : 0u;
+      }
+      break;
+    }
+
     case DBG_CMD_ERASE_ALL:
-      memset(dbg_all, 0xFF, sizeof(dbg_all));
-      dbg_status = eeprom_write(&ee, 0, dbg_all, EEPROM_SIZE);
+      Tmr_Start();
+      EXTEPROM_flashData_eraseAll();
+      Tmr_Stop();
+      st_erase_all = EXTEPROM_Status_Get();  dbg_status = st_erase_all;
+      ok_erase_all = 0;
+      if (st_erase_all == EXTEPROM_OK)
+      {
+        EXTEPROM_Data_Direct_Read(0, dbg_all, EXTEPROM_SIZE_BYTES);
+        ok_erase_all = ((EXTEPROM_Status_Get() == EXTEPROM_OK) &&
+                        All_Equal(dbg_all, EXTEPROM_SIZE_BYTES, 0xFFu)) ? 1u : 0u;
+        Check_Region(dbg_all);          /* now dbg_verify_ok = 0, as expected */
+      }
+      break;
+
+    case DBG_CMD_REINIT:
+      Tmr_Start();
+      EXTEPROM_init(dbg_clk_mhz);
+      Tmr_Stop();
+      st_init = EXTEPROM_Status_Get();  dbg_status = st_init;
+      EXTEPROM_Capabilities_Get(&ee_caps);
+      break;
+
+    case DBG_CMD_SELFTEST:
+      selftest_fail_step = SelfTest();
+      selftest_pass      = (selftest_fail_step == 0u) ? 1u : 0u;
+      dbg_status         = EXTEPROM_Status_Get();
       break;
 
     default:
-      break;                     /* unknown command: just clear it */
+      break;                            /* unknown command: just clear it */
   }
 
   dbg_cmd_done_count++;
-  dbg_cmd = DBG_CMD_NONE;        /* tells you "done" */
+  dbg_cmd = DBG_CMD_NONE;               /* tells you "done" */
 }
 /* USER CODE END 0 */
 
