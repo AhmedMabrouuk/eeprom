@@ -30,3 +30,13 @@ sources.mk
 makefile
 eeprom/Debug/eeprom.elf
 eeprom/Debug/eeprom.elf
+eeprom/Debug/eeprom.elf
+eeprom/Debug/eeprom.elf
+eeprom/Debug/eeprom.list
+eeprom/Debug/eeprom.map
+eeprom/Debug/objects.list
+eeprom/Debug/Core/Src/main.cyclo
+eeprom/Debug/Core/Src/main.d
+eeprom/Debug/Core/Src/main.o
+eeprom/Debug/Core/Src/main.su
+eeprom/Debug/Core/Src/subdir.mk
