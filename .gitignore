@@ -28,3 +28,5 @@ sources.mk
 *.cyclo
 *.su
 makefile
+eeprom/Debug/eeprom.elf
+eeprom/Debug/eeprom.elf

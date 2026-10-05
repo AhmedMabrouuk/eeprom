@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "exteprom.h"
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define EEPROM_SYS_CLK_MHZ   16u      /* system clock in MHz (HSI16, no PLL) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,7 +44,20 @@
 I2C_HandleTypeDef hi2c1;
 
 /* USER CODE BEGIN PV */
+/* ===== ALL GLOBAL -> add them to Live Expressions ===== */
 
+/* ---- the monitor array ---- */
+uint8_t  ee_dump[EXTEPROM_SIZE_BYTES];       /* WHOLE eeprom: read at reset, then again after every write/erase */
+uint8_t  ee_dump_boot[EXTEPROM_SIZE_BYTES];  /* copy of the eeprom as it was at reset (before any write)       */
+uint32_t ee_dump_count = 0;                  /* +1 each time ee_dump is refreshed                              */
+volatile EXTEPROM_Status_t ee_dump_status = EXTEPROM_ERR_NOT_INIT;  /* status of that read (0 = OK)          */
+uint8_t  test_step = 0;                      /* which test step is running (1..7)                              */
+
+/* ---- test data ---- */
+uint8_t  ee_wr_data[21];                     /* 30, 31, ... 50                                                 */
+uint8_t  ee_wr_small[5] = { 1, 2, 3, 4, 5 };
+uint8_t  ee_rd_byte = 0;                     /* result of the direct single-byte read                          */
+uint8_t  ee_rd_page[EXTEPROM_PAGE_SIZE_BYTES]; /* result of the direct page read                               */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -51,12 +65,20 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void EEPROM_Debug_ReadAll(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* Debug function: reads the WHOLE eeprom into ee_dump.
+ * Called once at reset, then after every write / erase. */
+static void EEPROM_Debug_ReadAll(void)
+{
+  EXTEPROM_Data_Direct_Read(0, ee_dump, EXTEPROM_SIZE_BYTES);
+  ee_dump_status = EXTEPROM_Status_Get();
+  ee_dump_count++;                 /* <- put a breakpoint on this line to step through the tests */
+}
 /* USER CODE END 0 */
 
 /**
@@ -90,6 +112,44 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+
+  /* 1. init the driver with the system clock in MHz */
+  test_step = 1;
+  EXTEPROM_init(EEPROM_SYS_CLK_MHZ);
+
+  /* 2. read the whole eeprom at reset and keep a copy of what it held */
+  test_step = 2;
+  EEPROM_Debug_ReadAll();
+  memcpy(ee_dump_boot, ee_dump, sizeof(ee_dump_boot));
+
+  /* 3. write 30..50 at addresses 30..50 (crosses 3 page edges: 32, 40, 48) */
+  test_step = 3;
+  for (uint8_t i = 0; i < sizeof(ee_wr_data); i++)
+  {
+    ee_wr_data[i] = (uint8_t)(30u + i);
+  }
+  EXTEPROM_Data_Direct_Write(30, ee_wr_data, sizeof(ee_wr_data));
+  EEPROM_Debug_ReadAll();
+
+  /* 4. direct reads: byte 33 must be 33, page 4 (addresses 32..39) must be 32..39 */
+  test_step = 4;
+  EXTEPROM_Data_Direct_Read(33, &ee_rd_byte, 1);
+  EXTEPROM_Data_Direct_Read(32, ee_rd_page, EXTEPROM_PAGE_SIZE_BYTES);
+
+  /* 5. erase ONE byte: address 40 becomes 255, its neighbours stay */
+  test_step = 5;
+  EXTEPROM_Data_Byte_Erase(40);
+  EEPROM_Debug_ReadAll();
+
+  /* 6. erase ONE block (block 4 = addresses 32..39) */
+  test_step = 6;
+  EXTEPROM_flashData_erase(4);
+  EEPROM_Debug_ReadAll();
+
+  /* 7. write 5 bytes at address 6 (crosses the page edge at 8) */
+  test_step = 7;
+  EXTEPROM_Data_Direct_Write(6, ee_wr_small, sizeof(ee_wr_small));
+  EEPROM_Debug_ReadAll();
 
   /* USER CODE END 2 */
 
